@@ -4,6 +4,9 @@ import (
 	"bufio"
 	"flag"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"io"
 	"os"
 	"path/filepath"
@@ -24,6 +27,7 @@ const (
 	nameGoPath   = "GOPATH"
 	extGo        = ".go"
 	dirChunkSize = 100
+	typeString   = "string"
 )
 
 // Generator names
@@ -38,20 +42,26 @@ const (
 
 // Target is the name and location of the variable to push some data into.
 type Target struct {
-	Var  string
-	Pkg  string
-	Path string
+	Var string
+	Pkg string
+	Gen string
 }
 
 var (
 	// The map of known target variable names and generators for them.
 	// Variables names are case insensitive.
-	KnownTargets = map[string]string{
+	knownTargetParser = map[string]string{
+		"Version":        GenVersion,
 		"BuildVersion":   GenVersion,
+		"SymVer":         GenVersion,
 		"BuildSymVer":    GenVersion,
+		"GitTag":         GenTag,
 		"BuildTag":       GenTag,
+		"GitHash":        GenHash,
 		"BuildHash":      GenHash,
+		"GitHashShort":   GenHashShort,
 		"BuildHashShort": GenHashShort,
+		"GitHashLong":    GenHashLong,
 		"BuildHashLong":  GenHashLong,
 		"BuildTime":      GenTime,
 	}
@@ -59,11 +69,7 @@ var (
 
 // Regular expressions for parsing various things
 var (
-	reGoModPackage      = regexp.MustCompile("^module (.+)$")
-	reCommentBlockOpen  = regexp.MustCompile(`^\s*\\\*`)
-	reCommentBlockClose = regexp.MustCompile(`\*\\\\s*$`)
-	rePackageName       = regexp.MustCompile(`^\s*package\s+(\S+)`)
-	reKnownTargets      *regexp.Regexp
+	reGoModPackage = regexp.MustCompile("^module (.+)$")
 )
 
 // Command line options
@@ -97,18 +103,7 @@ func main() {
 		rootDir = dir
 	}
 
-	var knownTargetsList string
-	for key, _ := range KnownTargets {
-		if len(knownTargetsList) > 0 {
-			knownTargetsList += "|"
-		}
-		knownTargetsList += key
-	}
-	if reKnownTargets, err = regexp.Compile("\b(?i)(" + knownTargetsList + ")\\s+string\\b"); err != nil {
-		panic("failed to compile know targets parser: " + err.Error())
-	}
-
-	// Generate version
+	// Find which is the root package
 	pkg, err := rootPkg(rootDir)
 	if err != nil {
 		panic("failed to find root package: " + err.Error())
@@ -116,7 +111,31 @@ func main() {
 		panic("failed to find root package")
 	}
 
+	// Find all target variables which should be substituted
+	targets, err := findAllTargets(rootDir)
+	if err != nil {
+		panic("failed to scan targets: " + err.Error())
+	} else {
+		// Fix target packages
+		for i := 0; i < len(targets); i++ {
+			stripped := stripHeadPath(targets[i].Pkg, rootDir)
+			if len(stripped) > 0 {
+				targets[i].Pkg = strings.ReplaceAll(pkg+"/"+stripped, string(filepath.Separator), "/")
+			} else {
+				targets[i].Pkg = strings.ReplaceAll(pkg, string(filepath.Separator), "/")
+			}
+		}
+	}
+
+	// Dump debug info
 	msg("Root package is %s\n", pkg)
+	if len(targets) > 0 {
+		for _, t := range targets {
+			msg("Target %s.%s with %s generator\n", t.Pkg, t.Var, t.Gen)
+		}
+	} else {
+		msg("No targets found\n")
+	}
 
 	os.Exit(ExitOk)
 }
@@ -165,18 +184,7 @@ func readPkgFromMod(path string) (string, error) {
 // makePkgFromPath makes package from the path given and based on GOPATH env.
 func makePkgFromPath(path string) string {
 	srcPath := filepath.Join(os.Getenv(nameGoPath), "src")
-	if index := strings.Index(path, srcPath); index >= 0 {
-		// Strip GOAPTH from path
-		path = path[index+len(srcPath):]
-		sep := string(filepath.Separator)
-		if strings.HasPrefix(path, sep) {
-			path = path[len(sep):]
-		}
-		if strings.HasSuffix(path, sep) {
-			path = path[:len(path)-len(sep)]
-		}
-	}
-	return path
+	return stripHeadPath(path, srcPath)
 }
 
 // StopReading is the special case for text stream iterator which means stop further reading.
@@ -215,7 +223,7 @@ func iterTextLines(reader io.ReadCloser, processor func([]byte) error) error {
 }
 
 // findAllTargets scans the file tree and finds locations of variables to push version info into.
-func findAllTargets(path string) ([]Target, error) {
+func findAllTargets(dir string) ([]Target, error) {
 	var (
 		mut     sync.Mutex
 		targets []Target
@@ -238,20 +246,25 @@ func findAllTargets(path string) ([]Target, error) {
 		mut.Unlock()
 	}
 
-	var processor func(info os.FileInfo) error
-	processor = func(info os.FileInfo) error {
+	var processor func(dir string, info os.FileInfo) error
+	processor = func(dir string, info os.FileInfo) error {
+		fullPath := filepath.Join(dir, info.Name())
+
 		// Launch a new directory scanner if the file is of dir type or
 		// scan for target variables if that is a *.go file.
 		if info.IsDir() {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				if err := scanDir(info.Name(), processor); err != nil {
-					pushErr(info, err)
-				}
-			}()
+			// Skip parsing directories starting from dot
+			if !strings.HasPrefix(info.Name(), ".") {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					if err := scanDir(fullPath, processor); err != nil {
+						pushErr(info, err)
+					}
+				}()
+			}
 		} else if filepath.Ext(info.Name()) == extGo {
-			if targets, err := scanTargets(info.Name()); err != nil {
+			if targets, err := scanTargets(fullPath); err != nil {
 				pushErr(info, err)
 			} else if len(targets) > 0 {
 				pushTargets(targets)
@@ -263,7 +276,7 @@ func findAllTargets(path string) ([]Target, error) {
 
 	// Start scanning form the root directory
 	wg.Add(1)
-	if err := scanDir(path, processor); err != nil {
+	if err := scanDir(dir, processor); err != nil {
 		pushErr(nil, err)
 	}
 	wg.Done()
@@ -277,7 +290,7 @@ func findAllTargets(path string) ([]Target, error) {
 }
 
 // scanDir iterates over all files in the directory and runs the processor on the each.
-func scanDir(path string, processor func(os.FileInfo) error) error {
+func scanDir(path string, processor func(string, os.FileInfo) error) error {
 	dir, err := os.Open(path)
 	if err != nil {
 		return err
@@ -294,7 +307,7 @@ func scanDir(path string, processor func(os.FileInfo) error) error {
 		}
 
 		for _, file := range files {
-			if err = processor(file); err != nil {
+			if err = processor(path, file); err != nil {
 				return err
 			}
 		}
@@ -305,31 +318,85 @@ func scanDir(path string, processor func(os.FileInfo) error) error {
 
 // scanTargets scans the file for target variables.
 func scanTargets(path string) ([]Target, error) {
-	file, err := os.Open(path)
+	var targets []Target
+
+	// Build the AST of the file
+	file, err := parser.ParseFile(token.NewFileSet(), path, nil, parser.DeclarationErrors)
 	if err != nil {
 		return nil, err
 	}
-	defer file.Close()
 
-	var (
-		targets            []Target
-		pkg                string
-		insideCommentBlock bool
-	)
-	err = iterTextLines(file, func(line []byte) error {
-		if reCommentBlockOpen.Match(line) {
-			insideCommentBlock = true
+	// Extract all matched targets
+	for _, decl := range file.Decls {
+		// Skip the declaration unless that is var
+		gen, ok := decl.(*ast.GenDecl)
+		if !ok {
+			continue
 		}
-		if reCommentBlockClose.Match(line) {
-			insideCommentBlock = false
+		if gen.Tok != token.VAR {
+			continue
 		}
-		if !insideCommentBlock {
-			if matches := rePackageName.FindSubmatch(line); len(matches) > 0 {
-				pkg = string(matches[len(matches)-1])
+
+		// Process variable declarations only
+		for _, spec := range gen.Specs {
+			// Ignore non value specs
+			val, ok := spec.(*ast.ValueSpec)
+			if !ok {
+				continue
+			}
+
+			// We can populate only strings so far. So skip non-string variables.
+			if ident, ok := val.Type.(*ast.Ident); ok {
+				if ident.Name != typeString {
+					continue
+				}
+			} else {
+				// Skip the declaration because the type is not known.
+				// I assume standard types are always populated as *ast.Ident.
+				continue
+			}
+
+			// Add to found targets all variables with known names.
+			for _, name := range val.Names {
+				if gen := findNameGen(name.Name); len(gen) > 0 {
+					pkg := filepath.Join(
+						filepath.Dir(filepath.Dir(path)), // remove the 2nd last dir name
+						file.Name.Name,                   // and replace it with the package name
+					)
+					targets = append(targets, Target{
+						Var: name.Name,
+						Pkg: pkg,
+						Gen: gen,
+					})
+				}
 			}
 		}
-		return nil
-	})
+	}
 
 	return targets, nil
+}
+
+// findNameGen returns the generator class for the name if it's known.
+func findNameGen(name string) string {
+	for key, value := range knownTargetParser {
+		if strings.EqualFold(key, name) {
+			return value
+		}
+	}
+	return ""
+}
+
+// stripHeadPath removes from the path the same heading path.
+func stripHeadPath(path, heading string) string {
+	if index := strings.Index(path, heading); index >= 0 {
+		path = path[index+len(heading):]
+		sep := string(filepath.Separator)
+		if strings.HasPrefix(path, sep) {
+			path = path[len(sep):]
+		}
+		if strings.HasSuffix(path, sep) {
+			path = path[:len(path)-len(sep)]
+		}
+	}
+	return path
 }
