@@ -51,19 +51,23 @@ var (
 	// The map of known target variable names and generators for them.
 	// Variables names are case insensitive.
 	knownTargetParser = map[string]string{
-		"Version":        GenVersion,
-		"BuildVersion":   GenVersion,
-		"SymVer":         GenVersion,
-		"BuildSymVer":    GenVersion,
-		"GitTag":         GenTag,
-		"BuildTag":       GenTag,
-		"GitHash":        GenHash,
-		"BuildHash":      GenHash,
-		"GitHashShort":   GenHashShort,
-		"BuildHashShort": GenHashShort,
-		"GitHashLong":    GenHashLong,
-		"BuildHashLong":  GenHashLong,
-		"BuildTime":      GenTime,
+		"Version":           GenVersion,
+		"BuildVersion":      GenVersion,
+		"SymVer":            GenVersion,
+		"BuildSymVer":       GenVersion,
+		"GitTag":            GenTag,
+		"BuildTag":          GenTag,
+		"BuildGitTag":       GenTag,
+		"GitHash":           GenHash,
+		"BuildHash":         GenHash,
+		"BuildGitHash":      GenHash,
+		"GitHashShort":      GenHashShort,
+		"BuildHashShort":    GenHashShort,
+		"BuildGitHashShort": GenHashShort,
+		"GitHashLong":       GenHashLong,
+		"BuildHashLong":     GenHashLong,
+		"BuildGitHashLong":  GenHashLong,
+		"BuildTime":         GenTime,
 	}
 )
 
