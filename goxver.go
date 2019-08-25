@@ -1,3 +1,13 @@
+/*
+goxver is the tool for generating LDFLAGS argument with version information populated.
+The tool works only with git repositories.
+
+	Usage:
+		go build `goxver` main.go
+
+Original idea and implementation by Andrew "workanator" Bashkatov.
+Licensed under MIT license.
+*/
 package main
 
 import (
