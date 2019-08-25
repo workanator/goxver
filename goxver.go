@@ -42,7 +42,8 @@ const (
 const (
 	nameGoMod        = "go.mod"
 	nameGoPath       = "GOPATH"
-	extGo            = ".go"
+	suffixGo         = ".go"
+	suffixTestGo     = " _test.go"
 	dirChunkSize     = 100
 	typeString       = "string"
 	timeFormat       = "2006-01-02_15:04:05_Z07:00"
@@ -310,7 +311,7 @@ func findAllTargets(dir string) ([]Target, error) {
 					}
 				}()
 			}
-		} else if filepath.Ext(info.Name()) == extGo {
+		} else if filepath.Ext(info.Name()) == suffixGo && !strings.HasSuffix(info.Name(), suffixTestGo) {
 			if targets, err := scanTargets(fullPath); err != nil {
 				pushErr(info, err)
 			} else if len(targets) > 0 {
