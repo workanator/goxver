@@ -49,6 +49,7 @@ const (
 	timeFormat       = "2006-01-02_15:04:05_Z07:00"
 	versionPrefix    = "v"
 	versionSeparator = "."
+	gitDirName       = ".git"
 )
 
 // Generator names
@@ -130,6 +131,16 @@ func main() {
 		panic("failed to get absolute path: " + err.Error())
 	} else {
 		rootDir = dir
+	}
+
+	// Exit with error if the directory i snot found
+	if !fileExists(rootDir) {
+		panic("path does not exist")
+	}
+	// Exit silently if the git repository does not exists
+	if !fileExists(filepath.Join(rootDir, gitDirName)) {
+		msg("No git repository found\n")
+		os.Exit(ExitOk)
 	}
 
 	// Find which is the root package
@@ -605,4 +616,10 @@ func versionsFromTags(tags storer.ReferenceIter) (versions []Version, err error)
 		})
 	}
 	return
+}
+
+// fileExists tests if the file at the path exists.
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return !os.IsNotExist(err)
 }
