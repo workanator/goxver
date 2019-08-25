@@ -130,8 +130,9 @@ func main() {
 	// Dump debug info
 	msg("Root package is %s\n", pkg)
 	if len(targets) > 0 {
+		msg("Targets:\n")
 		for _, t := range targets {
-			msg("Target %s.%s with %s generator\n", t.Pkg, t.Var, t.Gen)
+			msg("  - %s.%s with %s generator\n", t.Pkg, t.Var, t.Gen)
 		}
 	} else {
 		msg("No targets found\n")
@@ -326,54 +327,57 @@ func scanTargets(path string) ([]Target, error) {
 		return nil, err
 	}
 
-	// Extract all matched targets
-	for _, decl := range file.Decls {
-		// Skip the declaration unless that is var
-		gen, ok := decl.(*ast.GenDecl)
-		if !ok {
-			continue
-		}
-		if gen.Tok != token.VAR {
-			continue
-		}
-
-		// Process variable declarations only
-		for _, spec := range gen.Specs {
-			// Ignore non value specs
-			val, ok := spec.(*ast.ValueSpec)
-			if !ok {
-				continue
-			}
-
-			// We can populate only strings so far. So skip non-string variables.
-			if ident, ok := val.Type.(*ast.Ident); ok {
-				if ident.Name != typeString {
-					continue
-				}
-			} else {
-				// Skip the declaration because the type is not known.
-				// I assume standard types are always populated as *ast.Ident.
-				continue
-			}
-
-			// Add to found targets all variables with known names.
-			for _, name := range val.Names {
-				if gen := findNameGen(name.Name); len(gen) > 0 {
-					pkg := filepath.Join(
-						filepath.Dir(filepath.Dir(path)), // remove the 2nd last dir name
-						file.Name.Name,                   // and replace it with the package name
-					)
-					targets = append(targets, Target{
-						Var: name.Name,
-						Pkg: pkg,
-						Gen: gen,
-					})
-				}
+	// Find the targets through the top-level declarations and
+	// add to found targets all variables with known names.
+	for _, val := range onlyStringValues(onlyVarDecls(file.Decls)) {
+		for _, name := range val.Names {
+			if gen := findNameGen(name.Name); len(gen) > 0 {
+				pkg := filepath.Join(
+					filepath.Dir(filepath.Dir(path)), // remove the 2nd last dir name
+					file.Name.Name,                   // and replace it with the package name
+				)
+				targets = append(targets, Target{
+					Var: name.Name,
+					Pkg: pkg,
+					Gen: gen,
+				})
 			}
 		}
 	}
 
 	return targets, nil
+}
+
+// onlyVarDecls filters the list of declarations leaving only GenDecl of VAR type.
+func onlyVarDecls(decls []ast.Decl) (vars []*ast.GenDecl) {
+	for _, decl := range decls {
+		if gen, ok := decl.(*ast.GenDecl); ok {
+			if gen.Tok == token.VAR {
+				vars = append(vars, gen)
+			}
+		}
+	}
+	return
+}
+
+// onlyStringValues flatten the list of variable declarations leaving only string variables.
+func onlyStringValues(decls []*ast.GenDecl) (values []*ast.ValueSpec) {
+	for _, decl := range decls {
+		for _, spec := range decl.Specs {
+			// Ignore non-value specs
+			val, ok := spec.(*ast.ValueSpec)
+			if !ok {
+				continue
+			}
+			// Leave only string variables
+			if ident, ok := val.Type.(*ast.Ident); ok {
+				if ident.Name == typeString {
+					values = append(values, val)
+				}
+			}
+		}
+	}
+	return
 }
 
 // findNameGen returns the generator class for the name if it's known.
