@@ -11,8 +11,15 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
+
+	git "gopkg.in/src-d/go-git.v4"
+	"gopkg.in/src-d/go-git.v4/plumbing"
+	"gopkg.in/src-d/go-git.v4/plumbing/storer"
 )
 
 // Exit codes
@@ -23,11 +30,14 @@ const (
 
 // Constants to have less or no magic numbers
 const (
-	nameGoMod    = "go.mod"
-	nameGoPath   = "GOPATH"
-	extGo        = ".go"
-	dirChunkSize = 100
-	typeString   = "string"
+	nameGoMod        = "go.mod"
+	nameGoPath       = "GOPATH"
+	extGo            = ".go"
+	dirChunkSize     = 100
+	typeString       = "string"
+	timeFormat       = "2006-01-02_15:04:05_Z07:00"
+	versionPrefix    = "v"
+	versionSeparator = "."
 )
 
 // Generator names
@@ -37,7 +47,7 @@ const (
 	GenHash      = "hash"       // The hash of the revision
 	GenHashShort = "hash_short" // The short hash of the revision
 	GenHashLong  = "hash_long"  // The long hash of the revision
-	GenTime      = "time"       // The current time in format YYYY-MM-DD HH:MM:SS
+	GenTime      = "time"       // The current time in format YYYY-MM-DD_HH:MM:SS_Z
 )
 
 // Target is the name and location of the variable to push some data into.
@@ -74,16 +84,20 @@ var (
 // Regular expressions for parsing various things
 var (
 	reGoModPackage = regexp.MustCompile("^module (.+)$")
+	reVersion      = regexp.MustCompile(`^v?\d+(?:\.\d+){0,2}`)
 )
 
 // Command line options
 var (
-	rootDir string // The root directory of project (-d path)
-	verbose bool   // Enable verbose mode (-v)
+	rootDir         string // The root directory of project (-d path)
+	doubleQuote     bool   // Put generated values into double quotes (-qq)
+	treatHashAsLong bool   // Treat hash generator as long hash (-long-hash)
+	verbose         bool   // Enable verbose mode (-v)
 )
 
 func init() {
 	flag.StringVar(&rootDir, "d", ".", "The root directory of the project")
+	flag.BoolVar(&treatHashAsLong, "long-hash", false, "Treat hash generator as long hash")
 	flag.BoolVar(&verbose, "v", false, "Enable verbose mode")
 }
 
@@ -142,6 +156,24 @@ func main() {
 		msg("No targets found\n")
 	}
 
+	// Skip further processing if not targets found.
+	if len(targets) == 0 {
+		os.Exit(ExitOk)
+	}
+
+	// Open the git repository and generate LDFLAGS argment value.
+	repo, err := git.PlainOpen(rootDir)
+	if err != nil {
+		panic("failed to open git repository: " + err.Error())
+	}
+
+	value, err := generateLDFlags(repo, targets)
+	if err != nil {
+		panic("failed to generate LDFLAGS: " + err.Error())
+	}
+
+	// Print LDFLAGS argument at last, yay!
+	fmt.Print(value)
 	os.Exit(ExitOk)
 }
 
@@ -407,4 +439,159 @@ func stripHeadPath(path, heading string) string {
 		}
 	}
 	return path
+}
+
+// generateLDFlags generates LDFLAGS for targets found with the git repository info.
+func generateLDFlags(repo *git.Repository, targets []Target) (string, error) {
+	flags := make([]string, 0, len(targets))
+	for _, target := range targets {
+		var (
+			value string
+			err   error
+		)
+		switch target.Gen {
+		case GenVersion:
+			value, err = readGitLatestVersion(repo)
+		case GenTag:
+			value, err = readGitLatestTag(repo)
+		case GenHash, GenHashShort, GenHashLong:
+			if value, err = readGitHEAD(repo); err == nil {
+				if target.Gen == GenHashShort || (target.Gen == GenHash && !treatHashAsLong) {
+					value = value[:7]
+				}
+			}
+		case GenTime:
+			value = generateTime()
+		}
+		if err != nil {
+			return "", err
+		}
+		if len(value) > 0 {
+			flags = append(flags, fmt.Sprintf("-X %s.%s=%s", target.Pkg, target.Var, value))
+		}
+	}
+
+	return strings.Join(flags, " "), nil
+}
+
+// readGitLatestVersion returns the newest version tag from the git repository.
+func readGitLatestVersion(repo *git.Repository) (string, error) {
+	tags, err := repo.Tags()
+	if err != nil {
+		return "", err
+	}
+	defer tags.Close()
+
+	// Find all versions and returns the newest.
+	versions, err := versionsFromTags(tags)
+	if err != nil {
+		return "", err
+	}
+	if len(versions) > 0 {
+		return versions[0].String(), nil
+	}
+	return "", nil
+}
+
+// readGitLatestTag returns the latest tag from the git repository.
+func readGitLatestTag(repo *git.Repository) (string, error) {
+	tags, err := repo.Tags()
+	if err != nil {
+		return "", err
+	}
+	defer tags.Close()
+
+	ref, err := tags.Next()
+	if err != nil {
+		if err == io.EOF {
+			err = nil
+		}
+		return "", err
+	}
+	if ref != nil {
+		return quoteValue(ref.Name().Short()), nil
+	}
+
+	return "", nil
+}
+
+// readGitHEAD returns the hash of the HEAD of the git repository.
+func readGitHEAD(repo *git.Repository) (string, error) {
+	head, err := repo.Head()
+	if err != nil {
+		return "", err
+	}
+	return head.Hash().String(), nil
+}
+
+// generateTime formats the current time.
+func generateTime() string {
+	return time.Now().Format(timeFormat)
+}
+
+// quoteValue quotes the value with double or single quotes based on the doubleQuote option.
+func quoteValue(s string) string {
+	if doubleQuote {
+		return `"` + s + `"`
+	}
+	return "'" + s + "'"
+}
+
+// Version is a numeric representation semantic version.
+type Version struct {
+	Prefix              string
+	Major, Minor, Build int
+}
+
+// String composes a string representation of the version in symver format.
+func (v Version) String() string {
+	return fmt.Sprintf("%s%d.%d.%d", v.Prefix, v.Major, v.Minor, v.Build)
+}
+
+// Less tests if the version is less than the other.
+func (v Version) Less(other Version) bool {
+	if v.Major < other.Major {
+		return true
+	} else if v.Minor < other.Minor {
+		return true
+	} else if v.Build < other.Build {
+		return true
+	}
+	return false
+}
+
+// parseVersion parses the strings and makes a Version instance from it.
+// The function assumes the input value is in valid symver format w/ or w/o heading v.
+func parseVersion(s string) (v Version) {
+	if strings.HasPrefix(s, versionPrefix) {
+		s = s[len(versionPrefix):]
+		v.Prefix = versionPrefix
+	}
+
+	parts := strings.Split(s, versionSeparator)
+	v.Major, _ = strconv.Atoi(parts[0])
+	if len(parts) > 1 {
+		v.Minor, _ = strconv.Atoi(parts[1])
+	}
+	if len(parts) > 2 {
+		v.Build, _ = strconv.Atoi(parts[2])
+	}
+	return
+}
+
+// versionsFromTags makes the list of versions from the repository tags.
+// The list returned is sorted descending.
+func versionsFromTags(tags storer.ReferenceIter) (versions []Version, err error) {
+	err = tags.ForEach(func(ref *plumbing.Reference) error {
+		if reVersion.MatchString(ref.Name().Short()) {
+			versions = append(versions, parseVersion(ref.Name().Short()))
+		}
+		return nil
+	})
+	if err == nil {
+		sort.Slice(versions, func(i, j int) bool {
+			return versions[j].Less(versions[i])
+		})
+	}
+	return
 }
