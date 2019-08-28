@@ -178,6 +178,9 @@ func main() {
 		for t, g := range targetDict {
 			msg("  - %s = %s\n", t, g)
 		}
+	} else {
+		msg("No mappings\n")
+		os.Exit(ExitOk)
 	}
 
 	// Find which is the root package
