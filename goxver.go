@@ -3,7 +3,7 @@ goxver is the tool for generating LDFLAGS argument with version information popu
 The tool works only with git repositories.
 
 	Usage:
-		go build `goxver` main.go
+		go build -ldflags `goxver` main.go
 
 Original idea and implementation by Andrew "workanator" Bashkatov.
 Licensed under MIT license.
@@ -40,27 +40,39 @@ const (
 
 // Constants to have less or no magic numbers
 const (
-	nameGoMod        = "go.mod"
-	nameGoPath       = "GOPATH"
-	suffixGo         = ".go"
-	suffixTestGo     = " _test.go"
-	dirChunkSize     = 100
-	typeString       = "string"
-	timeFormat       = "2006-01-02_15:04:05_Z07:00"
-	versionPrefix    = "v"
-	versionSeparator = "."
-	gitDirName       = ".git"
+	currentDir        = "."
+	defaultConfigName = ".goxver"
+	goModName         = "go.mod"
+	goPathEnv         = "GOPATH"
+	goSourceSuffix    = ".go"
+	goTestSuffix      = " _test.go"
+	dirChunkSize      = 100
+	typeString        = "string"
+	timeFormat        = "2006-01-02_15:04:05_Z07:00"
+	versionPrefix     = "v"
+	versionSeparator  = "."
+	gitDirName        = ".git"
+	srcDirName        = "src"
+	mapSeparator      = ","
+	mapAssignment     = "="
 )
 
 // Generator names
 const (
 	GenVersion   = "version"    // The most recent symver in format vX[.Y[.Z]] or X[.Y[.Z]] form tags
 	GenTag       = "tag"        // The most recent tag
-	GenHash      = "hash"       // The hash of the revision
 	GenHashShort = "hash_short" // The short hash of the revision
 	GenHashLong  = "hash_long"  // The long hash of the revision
 	GenTime      = "time"       // The current time in format YYYY-MM-DD_HH:MM:SS_Z
 )
+
+var ValidGens = []string{
+	GenVersion,
+	GenTag,
+	GenHashShort,
+	GenHashLong,
+	GenTime,
+}
 
 // Target is the name and location of the variable to push some data into.
 type Target struct {
@@ -69,28 +81,13 @@ type Target struct {
 	Gen string
 }
 
+// TargetMap maps targets to generators.
+type TargetMap map[string]string
+
 var (
 	// The map of known target variable names and generators for them.
 	// Variables names are case insensitive.
-	knownTargetParser = map[string]string{
-		"Version":           GenVersion,
-		"BuildVersion":      GenVersion,
-		"SymVer":            GenVersion,
-		"BuildSymVer":       GenVersion,
-		"GitTag":            GenTag,
-		"BuildTag":          GenTag,
-		"BuildGitTag":       GenTag,
-		"GitHash":           GenHash,
-		"BuildHash":         GenHash,
-		"BuildGitHash":      GenHash,
-		"GitHashShort":      GenHashShort,
-		"BuildHashShort":    GenHashShort,
-		"BuildGitHashShort": GenHashShort,
-		"GitHashLong":       GenHashLong,
-		"BuildHashLong":     GenHashLong,
-		"BuildGitHashLong":  GenHashLong,
-		"BuildTime":         GenTime,
-	}
+	targetDict = TargetMap{}
 )
 
 // Regular expressions for parsing various things
@@ -101,15 +98,18 @@ var (
 
 // Command line options
 var (
-	rootDir         string // The root directory of project (-d path)
-	doubleQuote     bool   // Put generated values into double quotes (-qq)
-	treatHashAsLong bool   // Treat hash generator as long hash (-long-hash)
-	verbose         bool   // Enable verbose mode (-v)
+	rootDir     string // The root directory of project (-d path)
+	configPath  string // The path to the configuration file (-c path)
+	configMap   string // The mapping (-m mapping)
+	doubleQuote bool   // Put generated values into double quotes (-qq)
+	verbose     bool   // Enable verbose mode (-v)
 )
 
 func init() {
-	flag.StringVar(&rootDir, "d", ".", "The root directory of the project")
-	flag.BoolVar(&treatHashAsLong, "long-hash", false, "Treat hash generator as long hash")
+	flag.StringVar(&rootDir, "d", currentDir, "The root directory of the project")
+	flag.StringVar(&configPath, "c", "", "The path to the configuration file")
+	flag.StringVar(&configMap, "m", "", "The mapping")
+	flag.BoolVar(&doubleQuote, "qq", false, "Double quote values")
 	flag.BoolVar(&verbose, "v", false, "Enable verbose mode")
 }
 
@@ -143,6 +143,37 @@ func main() {
 		os.Exit(ExitOk)
 	}
 
+	// Load the configuration file
+	if len(configPath) == 0 {
+		configPath = findConfigFile(rootDir)
+	}
+	if len(configPath) > 0 {
+		msg("Loading configuration from %s\n", configPath)
+		if err := readConfigFile(configPath); err != nil {
+			panic("failed to read configuration file: " + err.Error())
+		}
+	} else {
+		msg("Use no configuration file\n")
+	}
+
+	if len(configMap) > 0 {
+		m, err := parseTargetMapping(configMap)
+		if err != nil {
+			panic("failed to parse mapping: " + err.Error())
+		}
+
+		for t, g := range m {
+			targetDict[t] = g
+		}
+	}
+
+	if len(targetDict) > 0 {
+		msg("Target mappings:\n")
+		for t, g := range targetDict {
+			msg("  - %s = %s\n", t, g)
+		}
+	}
+
 	// Find which is the root package
 	pkg, err := rootPkg(rootDir)
 	if err != nil {
@@ -154,16 +185,20 @@ func main() {
 	// Find all target variables which should be substituted
 	targets, err := findAllTargets(rootDir)
 	if err != nil {
-		panic("failed to scan targets: " + err.Error())
-	} else {
-		// Fix target packages
-		for i := 0; i < len(targets); i++ {
-			stripped := stripHeadPath(targets[i].Pkg, rootDir)
-			if len(stripped) > 0 {
-				targets[i].Pkg = strings.ReplaceAll(pkg+"/"+stripped, string(filepath.Separator), "/")
-			} else {
-				targets[i].Pkg = strings.ReplaceAll(pkg, string(filepath.Separator), "/")
-			}
+		// Do not panic of errors while parsing source code because
+		// here can be issued files in the work tree but they maybe not required for build.
+		// Also having goxver failing on source will fail the command the tool can
+		// be embedded into.
+		msg("failed to scan targets: " + err.Error() + "\n")
+	}
+
+	// Fix target packages
+	for i := 0; i < len(targets); i++ {
+		stripped := stripHeadPath(targets[i].Pkg, rootDir)
+		if len(stripped) > 0 {
+			targets[i].Pkg = strings.ReplaceAll(pkg+"/"+stripped, string(filepath.Separator), "/")
+		} else {
+			targets[i].Pkg = strings.ReplaceAll(pkg, string(filepath.Separator), "/")
 		}
 	}
 
@@ -219,7 +254,7 @@ func rootPkg(path string) (pkg string, err error) {
 
 // readPkgFromMod reads package from go.mod file if it exists.
 func readPkgFromMod(path string) (string, error) {
-	file, err := os.Open(filepath.Join(path, nameGoMod))
+	file, err := os.Open(filepath.Join(path, goModName))
 	if err != nil {
 		if os.IsNotExist(err) {
 			err = nil
@@ -242,7 +277,7 @@ func readPkgFromMod(path string) (string, error) {
 
 // makePkgFromPath makes package from the path given and based on GOPATH env.
 func makePkgFromPath(path string) string {
-	srcPath := filepath.Join(os.Getenv(nameGoPath), "src")
+	srcPath := filepath.Join(os.Getenv(goPathEnv), "src")
 	return stripHeadPath(path, srcPath)
 }
 
@@ -322,7 +357,7 @@ func findAllTargets(dir string) ([]Target, error) {
 					}
 				}()
 			}
-		} else if filepath.Ext(info.Name()) == suffixGo && !strings.HasSuffix(info.Name(), suffixTestGo) {
+		} else if filepath.Ext(info.Name()) == goSourceSuffix && !strings.HasSuffix(info.Name(), goTestSuffix) {
 			if targets, err := scanTargets(fullPath); err != nil {
 				pushErr(info, err)
 			} else if len(targets) > 0 {
@@ -440,7 +475,7 @@ func onlyStringValues(decls []*ast.GenDecl) (values []*ast.ValueSpec) {
 
 // findNameGen returns the generator class for the name if it's known.
 func findNameGen(name string) string {
-	for key, value := range knownTargetParser {
+	for key, value := range targetDict {
 		if strings.EqualFold(key, name) {
 			return value
 		}
@@ -476,9 +511,9 @@ func generateLDFlags(repo *git.Repository, targets []Target) (string, error) {
 			value, err = readGitLatestVersion(repo)
 		case GenTag:
 			value, err = readGitLatestTag(repo)
-		case GenHash, GenHashShort, GenHashLong:
+		case GenHashShort, GenHashLong:
 			if value, err = readGitHEAD(repo); err == nil {
-				if target.Gen == GenHashShort || (target.Gen == GenHash && !treatHashAsLong) {
+				if target.Gen == GenHashShort {
 					value = value[:7]
 				}
 			}
@@ -622,4 +657,78 @@ func versionsFromTags(tags storer.ReferenceIter) (versions []Version, err error)
 func fileExists(path string) bool {
 	_, err := os.Stat(path)
 	return !os.IsNotExist(err)
+}
+
+// parseTargetMapping parses the line with target to generator mapping.
+// Mapping must be in the format var=gen[,var=gen]* where
+// - var is the name of variable
+// - gen is the valid name of value generator (one of ValidGens)
+// - the string can contain multiple maps separated by comma
+func parseTargetMapping(s string) (m TargetMap, err error) {
+	items := strings.Split(s, mapSeparator)
+	m = make(TargetMap, len(items))
+	for _, item := range items {
+		parts := strings.Split(item, mapAssignment)
+		if len(parts) != 2 {
+			return nil, fmt.Errorf("invalid mapping %s", item)
+		}
+		if !isValidGen(parts[1]) {
+			return nil, fmt.Errorf("invalid generator %s", item)
+		}
+		m[parts[0]] = parts[1]
+	}
+	return m, nil
+}
+
+// isValidGen tests if the name of the generator is in valid set.
+func isValidGen(s string) bool {
+	for _, gen := range ValidGens {
+		if s == gen {
+			return true
+		}
+	}
+	return false
+}
+
+// findConfigFile searches for the config file in the directories in the follow order
+// 1. In the current directory.
+// 2. In the project directory.
+// 3. In the source directory under $GOPATH.
+func findConfigFile(projectDir string) string {
+	dirs := []string{
+		currentDir,
+		projectDir,
+		filepath.Join(os.Getenv(goPathEnv), srcDirName),
+	}
+	for _, dir := range dirs {
+		path := filepath.Join(dir, defaultConfigName)
+		if info, err := os.Stat(path); err == nil {
+			if !info.IsDir() {
+				return path
+			}
+		}
+	}
+	return ""
+}
+
+// readConfigFile reads and parses the configuration file.
+func readConfigFile(path string) error {
+	file, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	return iterTextLines(file, func(line []byte) error {
+		m, err := parseTargetMapping(string(line))
+		if err != nil {
+			return err
+		}
+
+		for t, g := range m {
+			targetDict[t] = g
+		}
+
+		return nil
+	})
 }
