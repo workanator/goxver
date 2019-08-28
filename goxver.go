@@ -84,6 +84,15 @@ type Target struct {
 // TargetMap maps targets to generators.
 type TargetMap map[string]string
 
+func (tm *TargetMap) CopyFrom(other TargetMap) {
+	if tm == nil {
+		*tm = make(TargetMap)
+	}
+	for t, g := range other {
+		(*tm)[t] = g
+	}
+}
+
 var (
 	// The map of known target variable names and generators for them.
 	// Variables names are case insensitive.
@@ -161,10 +170,7 @@ func main() {
 		if err != nil {
 			panic("failed to parse mapping: " + err.Error())
 		}
-
-		for t, g := range m {
-			targetDict[t] = g
-		}
+		targetDict.CopyFrom(m)
 	}
 
 	if len(targetDict) > 0 {
@@ -724,10 +730,7 @@ func readConfigFile(path string) error {
 		if err != nil {
 			return err
 		}
-
-		for t, g := range m {
-			targetDict[t] = g
-		}
+		targetDict.CopyFrom(m)
 
 		return nil
 	})
